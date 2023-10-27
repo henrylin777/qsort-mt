@@ -97,7 +97,6 @@ void print_array(void *base, int nums) {
 }
 
 int load_testcase(char **darray) {
-    char *line;
     int buf[256];
     int data;
     int cnt = 0;
@@ -148,8 +147,6 @@ start:
             bool done = true;
             for (pj = darray + elem_size; pj <= pi; pj += elem_size) {
                 if (mycmp(pj - elem_size, pj) > 0){
-                    // printf("swap!\n");
-                    int x = 1;
                     myswap(pj - elem_size, pj);
                     done = false;
                 }
@@ -159,11 +156,11 @@ start:
     }
     char *pmed = darray + (num_elem / 2) * elem_size;
     if (num_elem > 40) {
-        int piece = num_elem / 8;
-        char *tmp = darray + elem_size * (num_elem - 1);
+        int piece = num_elem / 9;
+        char *pend = darray + elem_size * (num_elem - 1);
         char *tmpa = find_median(darray, darray + piece, darray + piece * 2);
         char *tmpb = find_median(pmed - piece, pmed, pmed + piece);
-        char *tmpc = find_median(pmed + piece, tmp - piece, tmp);
+        char *tmpc = find_median(pend - piece * 2, pend - piece, pend);
         char *pmed = find_median(tmpa, tmpb, tmpc);
     }
     swapcode(DTYPE, darray, pmed, sizeof(DTYPE));
@@ -191,7 +188,6 @@ start:
     int nl = pl;
     int nr = num_elem - nl;
 
-
     /* try to launch new threads */
     if (common && nl > common->forkelem) {
         struct qsort *subtask = allocate_thread(common);
@@ -205,9 +201,9 @@ start:
     } else if (nl > 1) {
         qsort_algo(darray, nl, elem_size, NULL);
     }
-    if (num_elem - nl > 1) {
+    if (nr > 1) {
         darray = darray + nl * elem_size;
-        num_elem = num_elem - nl;
+        num_elem = nr;
         goto start;
     }
 }
@@ -255,19 +251,18 @@ again:
 };
 
 /* Initailize resources for multi-threading qsort */
-void qsort_mt(void *darray, int num_elem, size_t elem_size, int fork_elem) {
+void qsort_mt(void *darray, int num_elem, size_t elem_size, int fork_elem, int nthreads) {
 
-    int nthreads = 2;
     struct commoninfo common;
     struct qsort *worker;
     if (pthread_mutex_init(&common.lock_t, NULL) != 0){
-        DEBUG("Cannot init mutex, switch to single thread");
-        goto f1;
+        DEBUG("Cannot init mutex");
+        exit(1);
     };
     if ((common.pool = calloc(nthreads, sizeof(struct qsort))) == NULL){
-        DEBUG("Cannot init mutex, switch to single thread");
+        DEBUG("Cannot init mutex");
         verify(pthread_mutex_destroy(&common.lock_t));
-        goto f1;
+        exit(1);
     };
     for (int i = 0; i < nthreads; i++) {
         worker = &common.pool[i];
@@ -301,7 +296,7 @@ void qsort_mt(void *darray, int num_elem, size_t elem_size, int fork_elem) {
     verify(pthread_cond_signal(&worker->cond_st));
     verify(pthread_mutex_unlock(&worker->lock_st));
 
-finish:
+
     for (int i = 0; i < nthreads; i++) {
         worker = &common.pool[i];
         verify(pthread_join(worker->tid, NULL));
@@ -309,8 +304,6 @@ finish:
         verify(pthread_cond_destroy(&worker->cond_st));
     };
     free(common.pool);
-f1:
-    qsort_algo(darray, num_elem, elem_size, 0);
 
 };
 
@@ -336,10 +329,9 @@ void check(void *darray, int num_elem, size_t elem_size) {
 void usage(void) {
     fprintf(
         stderr,
-        "usage: main [-m] [-n elements] [-h threads] [-f fork_elements]\n"
-        "\t-m\tRun qsort in multi-threading\n"
+        "usage: main [-n elements] [-m threads] [-f fork_elements]\n"
+        "\t-m\tEnable multi-threading and specify the number of threads(Default is 2)\n"
         "\t-n\tNumber of elements (Default is 100000)\n"
-        "\t-h\tNumber of threads (Default is 2)\n"
         "\t-f\tMinimum number of elements for each thread (Default is 100)\n"
     );
     exit(1);
@@ -350,20 +342,18 @@ int main(int argc, char *argv[]){
     // int num_elem = load_testcase(&darray);
     // exit(1);
     int num_elem = 100000000;
-    int nthreads = 2;
-    int fork_elem = 100;
     bool use_mt = false;
+    int nthreads = 0;
+    int fork_elem = 100;
     int arg;
     char *endp;
-    while ((arg = getopt(argc, argv, "n:h:f:m")) != -1) {
+    while ((arg = getopt(argc, argv, "n:m:f:")) != -1) {
         switch (arg) {
             case 'm':
-                use_mt = true;
-                break;
-            case 'h':
+                use_mt = true; 
                 nthreads = (int) strtol(optarg, &endp, 10);
-                if (nthreads <= 0 || *endp != '\0' ) {
-                    warnx("Illegal argument of option 'h' (got '%s')", optarg);
+                if (nthreads <= 0 || nthreads > 8 || *endp != '\0' ) {
+                    warnx("Illegal argument of option 'm' (got '%s')", optarg);
                     usage();
                 }
                 break;
@@ -394,7 +384,7 @@ int main(int argc, char *argv[]){
     struct timeval start, end;
     gettimeofday(&start, NULL);
     if (use_mt && num_elem > fork_elem) {
-        qsort_mt(darray, num_elem, sizeof(DTYPE), fork_elem);  
+        qsort_mt(darray, num_elem, sizeof(DTYPE), fork_elem, nthreads);  
     } else {
         qsort_algo(darray, num_elem, sizeof(DTYPE), NULL);
     }
