@@ -2,3 +2,6 @@
 core*
 testcase*
 *.o
+
+# execute file
+main

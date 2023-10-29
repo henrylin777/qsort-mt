@@ -7,10 +7,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <err.h>
-
+#include "utils.c"
 
 #define DTYPE int
-#define DEBUG(format, ...) printf("[ %s:%d ] "format"", __FUNCTION__, __LINE__ , ##__VA_ARGS__)
+#define DEBUG(format, ...) printf("[ Thread: %lu ] :: "format"", pthread_self(), ##__VA_ARGS__)
+#define DEBUG(format, ...) {}
 
 /* Used to execute pthread function */
 #define verify(func)                                                      \
@@ -81,6 +82,44 @@ struct commoninfo {
     struct qsort *pool;  /* Thread pool */
 };
 
+/* 用來擋住 child thread 不要讓他自己工作 */
+static int work_wait(struct qsort *work) {
+    DEBUG("trying to get a lock...\n");
+    verify(pthread_mutex_lock(&work->lock_st));
+    DEBUG("hold the lock:%p\n", &work->lock_st);
+    while (work->status == ts_idle) {
+        DEBUG("release lock:%p and wait for condvar:%p\n", &work->lock_st, &work->cond_st);
+        verify(pthread_cond_wait(&work->cond_st, &work->lock_st));
+    }    
+    int status = work->status;
+    DEBUG("got released condvar:%p\n", &work->cond_st);
+    verify(pthread_mutex_unlock(&work->lock_st));
+    return status;
+}
+
+static void work_signal(struct qsort *work) {
+    DEBUG("DEBUG\n");
+    verify(pthread_mutex_lock(&work->lock_st));
+    work->status = ts_work;
+    verify(pthread_mutex_unlock(&work->lock_st));
+
+    DEBUG("send signal to condvar:%p\n", &work->cond_st);
+    verify(pthread_cond_signal(&work->cond_st));
+    
+}
+
+/* 用來告知自己已經完成工作, */
+static void work_done(struct commoninfo *common, struct qsort *work) {
+    verify(pthread_mutex_lock(&common->lock_t));
+    common->idlethreads++;
+    verify(pthread_mutex_unlock(&common->lock_t));
+
+    verify(pthread_mutex_lock(&work->lock_st));
+    DEBUG("set status to idle\n");
+    work->status = ts_idle;
+    verify(pthread_mutex_unlock(&work->lock_st));
+}
+
 
 static inline char *find_median(char *a, char *b, char *c) {
     return mycmp(a, b) < 0  
@@ -88,48 +127,27 @@ static inline char *find_median(char *a, char *b, char *c) {
                  : ((mycmp(b, c)) < 0 ? b : (mycmp(a, c) < 0 ? a : c));
 }
 
-void print_array(void *base, int nums) {
-    printf("Array: [");
-    for (char *i = (char *) base; i < (char *) base + nums * sizeof(DTYPE); i += sizeof(DTYPE)) {
-        printf(" %d", *(DTYPE *)i);
-    };
-    printf(" ]\n");
-}
-
-int load_testcase(char **darray) {
-    int buf[256];
-    int data;
-    int cnt = 0;
-    FILE *ptr = fopen("testcase1.txt", "r");
-    while(fscanf(ptr, "%d", &data) == 1) {
-        buf[cnt] = data;
-        cnt++;
-    }
-    DTYPE *arr = malloc(sizeof(DTYPE) * cnt);
-    for (int i = 0; i < cnt; i++) {
-        arr[i] = buf[i];
-    };
-    *darray = (char *)arr;
-    return cnt;
-}
-
 /* Allocate an idle thread from pool, change its state, lock its mutex, 
  * and decrease the number of idle threads. Return a pointer to its data area.
  * Return NULL if no thread is available.
  */
 struct qsort *allocate_thread(struct commoninfo *common) {
-    verify(pthread_mutex_lock(&common->lock_t));
     for (int i = 0; i < common->nthreads; i++) {
-        if (common->pool[i].status == ts_idle) {
-            common->idlethreads--;
-            common->pool[i].status = ts_work;
-            /* lock thread, make sure it would not execute before data is ready. */
-            verify(pthread_mutex_lock(&common->pool[i].lock_st));
-            verify(pthread_mutex_unlock(&common->lock_t));
-            return (&common->pool[i]);
-        }
+        DEBUG("try to allocate a thread\n");
+        struct qsort *worker = &common->pool[i];
+        if (pthread_mutex_trylock(&worker->lock_st) == 0) {
+            if (common->pool[i].status == ts_idle) {
+                // verify(pthread_mutex_lock(&common->lock_t));
+                // common->idlethreads--;
+                // verify(pthread_mutex_unlock(&common->lock_t));
+                /* lock thread, make sure it would not execute before data is ready. */
+                verify(pthread_mutex_unlock(&worker->lock_st));
+                return (&common->pool[i]);
+            }
+            verify(pthread_mutex_unlock(&worker->lock_st));
+        };
     }
-    verify(pthread_mutex_unlock(&common->lock_t));
+    DEBUG("no available thread\n");
     return (NULL);
 }
 
@@ -140,9 +158,10 @@ void qsort_algo(void *arr, int num_elem, size_t elem_size, struct commoninfo *co
     char *pi, *pj;
 
 start:
-    // printf("num of element: %d\n", num_elem);
+    DEBUG("common:%p\n", common);
     /* qsort(3) */
     if (num_elem < 7) { /* switch to bubble sort */
+        DEBUG("before bsort\n");
         for (pi = darray + (num_elem - 1) * elem_size; pi > darray; pi -= elem_size) {
             bool done = true;
             for (pj = darray + elem_size; pj <= pi; pj += elem_size) {
@@ -153,6 +172,7 @@ start:
             }
             if (done) return;
         }
+        return;
     }
     char *pmed = darray + (num_elem / 2) * elem_size;
     if (num_elem > 40) {
@@ -167,7 +187,7 @@ start:
 
     int pl = 1; 
     int pr = num_elem - 1;
-    // printf("debug\n");
+
     while (true) {
         while (pl < pr && (tmp = mycmp(darray + pl * elem_size, darray)) <= 0) {
             pl++;
@@ -183,70 +203,72 @@ start:
     if (mycmp(darray + pl * elem_size, darray) < 0)
         pl++;
     swapcode(DTYPE, darray + (pl - 1) * elem_size, darray, sizeof(DTYPE));
-
-    /* todo: what if pivot is the minimum？*/
     int nl = pl;
     int nr = num_elem - nl;
 
     /* try to launch new threads */
-    if (common && nl > common->forkelem) {
-        struct qsort *subtask = allocate_thread(common);
-        if (subtask) {
-            subtask->data = darray;
-            subtask->num_elem = nl;
-            /* All data is ready, start qsort */
-            verify(pthread_cond_signal(&subtask->cond_st));
-            verify(pthread_mutex_unlock(&subtask->lock_st));
+    if (nl > 1) {
+        if (common && nl > common->forkelem) {
+            struct qsort *subtask = allocate_thread(common);
+            if (subtask) {
+                DEBUG("got a idle thread: %lu\n", subtask->tid);
+                subtask->data = darray;
+                subtask->num_elem = nl;
+                /* All data is ready, start qsort */
+                verify(pthread_mutex_lock(&common->lock_t));
+                common->idlethreads--;
+                verify(pthread_mutex_unlock(&common->lock_t));
+                work_signal(subtask);
+                goto f2;
+            }
         }
-    } else if (nl > 1) {
-        qsort_algo(darray, nl, elem_size, NULL);
+        DEBUG("recursive qsort_algo\n");
+        qsort_algo(darray, nl, elem_size, common);
     }
+f2:
     if (nr > 1) {
         darray = darray + nl * elem_size;
         num_elem = nr;
+        DEBUG("goto start\n");
         goto start;
     }
 }
 
 /* Thread entry point */
 void *qsort_thread(void *p) {
+    DEBUG("Initialize...\n");
     struct qsort *qdata = p;
     struct commoninfo *common = qdata->common;
 again:
     /* Wait for signal */
-    verify(pthread_mutex_lock(&qdata->lock_st));
-    while (qdata->status == ts_idle)
-        verify(pthread_cond_wait(&qdata->cond_st, &qdata->lock_st));
-    verify(pthread_mutex_unlock(&qdata->lock_st));
-    // todo: who change the status to ts_term ????
-    if (qdata->status == ts_term)
+    if (work_wait(qdata) == ts_term)
         return NULL;
-    
-    // todo: needed?
-    assert(qdata->status == ts_work);
+    DEBUG("start qsort_algo!\n");
     qsort_algo(qdata->data, qdata->num_elem, common->elem_size, common);
-
-    /* finish the job, release the thread */
-    verify(pthread_mutex_lock(&common->lock_t));
-    qdata->status == ts_idle;
-    common->idlethreads++;
+    DEBUG("finish qsort_algo\n");
+    /* job finished, release thread */
+    work_done(common, qdata);
+    
     /* if there is no working thread(this is the last working thread), then terminate all threads */
-    if (common->idlethreads == common->nthreads) {
+    verify(pthread_mutex_lock(&common->lock_t));
+    int idle_t = common->idlethreads;
+    verify(pthread_mutex_unlock(&common->lock_t));
+    
+    if (idle_t == common->nthreads) {
+        DEBUG("no working threads, terminate all threads\n");
         struct qsort *new_worker;
         for (int i = 0; i < common->nthreads; i++) {
             new_worker = &common->pool[i];
-            if (new_worker == qdata)
-                continue;
+            if (new_worker == qdata) continue;
             verify(pthread_mutex_lock(&new_worker->lock_st));
-            // todo: why doing this ???
             new_worker->status = ts_term;
             verify(pthread_cond_signal(&new_worker->cond_st));
             verify(pthread_mutex_unlock(&new_worker->lock_st));
         }
-        verify(pthread_mutex_unlock(&common->lock_t));
+        // qdata->status = ts_term;
         return NULL;
     }
-    verify(pthread_mutex_unlock(&common->lock_t));
+    DEBUG("goto again\n");
     goto again;
 };
 
@@ -284,22 +306,33 @@ void qsort_mt(void *darray, int num_elem, size_t elem_size, int fork_elem, int n
     common.forkelem = fork_elem;
     common.idlethreads = common.nthreads = nthreads;
     common.elem_size = sizeof(DTYPE);
-
+    // sleep(0.5);
     /* initialize the first work thread */
     worker = &common.pool[0];
-    verify(pthread_mutex_lock(&worker->lock_st));
+    // verify(pthread_mutex_lock(&worker->lock_st));
+    DEBUG("get the first worker\n");
     worker->data = darray;
     worker->num_elem = num_elem;
-    worker->status = ts_work;
+    
+    verify(pthread_mutex_lock(&common.lock_t));
     common.idlethreads--;
+    verify(pthread_mutex_unlock(&common.lock_t));
+
+    work_signal(worker);
+    
     /* start to qsort */
+    DEBUG("release the condvar:%p\n", &worker->cond_st);
     verify(pthread_cond_signal(&worker->cond_st));
-    verify(pthread_mutex_unlock(&worker->lock_st));
+    // verify(pthread_mutex_unlock(&worker->lock_st));
 
-
+    DEBUG("waiting all threads...\n");
     for (int i = 0; i < nthreads; i++) {
         worker = &common.pool[i];
         verify(pthread_join(worker->tid, NULL));
+    };
+
+    for (int i = 0; i < nthreads; i++) {
+        worker = &common.pool[i];
         verify(pthread_mutex_destroy(&worker->lock_st));
         verify(pthread_cond_destroy(&worker->cond_st));
     };
@@ -307,55 +340,34 @@ void qsort_mt(void *darray, int num_elem, size_t elem_size, int fork_elem, int n
 
 };
 
-
-
-void check(void *darray, int num_elem, size_t elem_size) {
-
-    int idx = 0;
-    DTYPE cur, next;
-    while(idx < num_elem - 1) {
-        cur = *((DTYPE *) darray + idx);
-        next = *((DTYPE *) darray + idx + 1);
-        if(cur > next){
-            printf("Sort error at index:%d (data is '%d' and next is '%d')\n", idx, cur, next);
-            return;
-        }
-        idx++;
-    }
-    printf("correct\n");
-    return;
-}
-
 void usage(void) {
     fprintf(
         stderr,
-        "usage: main [-n elements] [-m threads] [-f fork_elements]\n"
-        "\t-m\tEnable multi-threading and specify the number of threads(Default is 2)\n"
+        "usage: main [-tm] [-n elements] [-h threads] [-f fork_elements]\n"
+        "\t-t\tPrint the execution time\n"
+        "\t-m\tEnable multi-threading\n"
         "\t-n\tNumber of elements (Default is 100000)\n"
+        "\t-h\tSpecify the number of threads in multi-threading mode (Default is 2)\n"
         "\t-f\tMinimum number of elements for each thread (Default is 100)\n"
     );
     exit(1);
 }
 
 int main(int argc, char *argv[]){
-    // char *darray;
-    // int num_elem = load_testcase(&darray);
-    // exit(1);
-    int num_elem = 100000000;
-    bool use_mt = false;
-    int nthreads = 0;
+    int num_elem = 1000;
+    bool opt_mt = false;
+    bool opt_time = false;
+    int nthreads = 2;
     int fork_elem = 100;
     int arg;
     char *endp;
-    while ((arg = getopt(argc, argv, "n:m:f:")) != -1) {
+    while ((arg = getopt(argc, argv, "n:h:f:tm")) != -1) {
         switch (arg) {
+            case 't':
+                opt_time = true; 
+                break;
             case 'm':
-                use_mt = true; 
-                nthreads = (int) strtol(optarg, &endp, 10);
-                if (nthreads <= 0 || nthreads > 8 || *endp != '\0' ) {
-                    warnx("Illegal argument of option 'm' (got '%s')", optarg);
-                    usage();
-                }
+                opt_mt = true; 
                 break;
             case 'n':
                 num_elem = (int) strtol(optarg, &endp, 10);
@@ -371,27 +383,37 @@ int main(int argc, char *argv[]){
                     usage();
                 }
                 break;
+            case 'h':
+                nthreads = (int) strtol(optarg, &endp, 10);
+                if (nthreads <= 0 || nthreads > 8 || *endp != '\0' ) {
+                    warnx("Illegal argument of option 'm' (got '%s')", optarg);
+                    usage();
+                }
+                break;
             default:
                 usage();
         }
     }
     // struct rusage ru;
     DTYPE *darray = malloc(sizeof(DTYPE) * num_elem);
-    for (int i = 0; i < num_elem; i++) {
-        darray[i] = rand() % num_elem;
-    }
-
     struct timeval start, end;
+    for (int i = 0; i < num_elem; i++)
+        darray[i] = rand() % num_elem;
     gettimeofday(&start, NULL);
-    if (use_mt && num_elem > fork_elem) {
+    if (opt_mt && num_elem > fork_elem) {
         qsort_mt(darray, num_elem, sizeof(DTYPE), fork_elem, nthreads);  
     } else {
         qsort_algo(darray, num_elem, sizeof(DTYPE), NULL);
     }
     gettimeofday(&end, NULL);
     // getrusage(RUSAGE_SELF, &ru);
-    check(darray, num_elem, sizeof(DTYPE));
-    printf(
-        "%.3g\n",
-        (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1e6);
+    if (opt_time)
+        printf("%.3g\n", (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1e6);
+    int res = check(darray, num_elem, sizeof(DTYPE));
+    if (res != -1) {
+        printf("sort error at index:%d (current is '%d' and next is '%d')\n", res, darray[res], darray[res+1]);
+        exit(1);
+    } else {
+        printf("success\n");
+    }
 }
